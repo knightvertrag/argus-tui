@@ -12,6 +12,10 @@ futures = "0.3.32"
 ratatui = "0.30.2"
 tokio = { version = "1.52.3", features = ["full"] }
 color-eyre = "0.6.5"
+anyhow = "1.0.104"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
