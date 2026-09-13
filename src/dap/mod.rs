@@ -1,8 +1,8 @@
-#![allow(dead_code)]
-
 mod client;
+mod framing;
 pub mod types;
 
-struct Dap {
-    dap: tokio::process::Child,
-}
+pub use client::{Client, Incoming};
+
+#[allow(unused_imports)]
+pub use client::ClientError;

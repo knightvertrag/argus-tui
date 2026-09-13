@@ -2,8 +2,8 @@
 
 > A professional, educational roadmap for building a modern Rust TUI frontend for debugging C programs using the Debug Adapter Protocol (DAP) and `lldb-dap`.
 
-**Status:** Initial design  
-**Last updated:** 2026-08-24  
+**Status:** Initial design; DAP types + framing + sequential client + smoke harness exist (see [architecture.md](./architecture.md) and [dap-implementation.md](./dap-implementation.md))  
+**Last updated:** 2026-09-11  
 **Target audience:** Intermediate learner (beginner–intermediate Rust, no prior TUI or deep debugger experience)
 
 ---

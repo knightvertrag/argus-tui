@@ -1,15 +1,18 @@
 mod dap;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-fn main() -> Result<()> {
-    // ---------------------------------------------------------------
-    // 1. Locate the program we want to debug
-    // ---------------------------------------------------------------
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+
+use dap::types::{
+    ConfigurationDone, Disconnect, DisconnectArguments, Event, Initialize, InitializeArguments,
+    Launch, LaunchArguments, Request, StoppedReason,
+};
+use dap::{Client, Incoming};
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let program = PathBuf::from("testdata/hello");
     if !program.exists() {
         bail!(
@@ -18,164 +21,106 @@ fn main() -> Result<()> {
     }
     let program = program.canonicalize()?;
 
-    // ---------------------------------------------------------------
-    // 2. Spawn lldb-dap
-    // ---------------------------------------------------------------
-    let mut child = Command::new("xcrun")
-        .arg("lldb-dap")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // so we see lldb-dap errors
-        .spawn()
-        .context("failed to spawn lldb-dap. Is it on your PATH?")?;
+    let mut client = Client::spawn()?;
 
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
+    let _caps = send::<Initialize>(&mut client, InitializeArguments::new("lldb-dap")).await?;
 
-    let mut seq = 1u64;
+    let mut launch = LaunchArguments::new(program.to_string_lossy());
+    launch.stop_on_entry = Some(true);
+    send::<Launch>(&mut client, launch).await?;
 
-    // ---------------------------------------------------------------
-    // Helper: send a DAP request
-    // ---------------------------------------------------------------
-    let mut send = |command: &str, arguments: Value| -> Result<()> {
-        let body = json!({
-            "seq": seq,
-            "type": "request",
-            "command": command,
-            "arguments": arguments,
-        });
-        seq += 1;
-
-        let body_str = serde_json::to_string(&body)?;
-        let msg = format!("Content-Length: {}\r\n\r\n{}", body_str.len(), body_str);
-
-        print!("→ {}", body_str);
-        println!();
-        stdin.write_all(msg.as_bytes())?;
-        stdin.flush()?;
-        Ok(())
-    };
-
-    // ---------------------------------------------------------------
-    // Helper: read one complete DAP message
-    // ---------------------------------------------------------------
-    let mut read_message = || -> Result<Value> {
-        // Read headers
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                bail!("lldb-dap closed stdout unexpectedly");
-            }
-            let line = line.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                break;
-            }
-            if let Some(rest) = line.strip_prefix("Content-Length:") {
-                content_length = Some(rest.trim().parse::<usize>()?);
-            }
+    recv_until(&mut client, |incoming| match incoming {
+        Incoming::Event(Event::Initialized) => {
+            println!("✓ initialized event");
+            true
         }
-
-        let len = content_length.context("missing Content-Length header")?;
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
-
-        let value: Value = serde_json::from_slice(&buf)?;
-        println!("← {}", serde_json::to_string_pretty(&value)?);
-        Ok(value)
-    };
-
-    // ---------------------------------------------------------------
-    // 3. initialize
-    // ---------------------------------------------------------------
-    send(
-        "initialize",
-        json!({
-            "clientID": "cdebugger",
-            "clientName": "C Debugger TUI",
-            "adapterID": "lldb-dap",
-            "pathFormat": "path",
-            "linesStartAt1": true,
-            "columnsStartAt1": true,
-            // You can claim more capabilities later
-            "supportsVariableType": true,
-            "supportsVariablePaging": false,
-        }),
-    )?;
-
-    // 2. Wait ONLY for the initialize response
-    loop {
-        let msg = read_message()?;
-        if msg["type"] == "response" && msg["command"] == "initialize" {
-            assert!(
-                msg["success"].as_bool().unwrap_or(false),
-                "initialize failed: {msg}"
+        Incoming::Event(event) => {
+            println!(
+                "← event {}",
+                serde_json::to_string(event).unwrap_or_default()
             );
-            break;
+            false
         }
-    }
-
-    // 3. Send launch immediately. Do NOT wait for initialized first.
-    send(
-        "launch",
-        json!({
-            "program": program,
-            "stopOnEntry": true,
-        }),
-    )?;
-    // 4. Drain until we have both initialized + launch response
-    let mut got_initialized = false;
-    let mut got_launch = false;
-    while !(got_initialized && got_launch) {
-        let msg = read_message()?;
-        match msg["type"].as_str() {
-            Some("event") if msg["event"] == "initialized" => {
-                got_initialized = true;
-                println!("✓ initialized event");
-            }
-            Some("response") if msg["command"] == "launch" => {
-                assert!(
-                    msg["success"].as_bool().unwrap_or(false),
-                    "launch failed: {msg}"
-                );
-                got_launch = true;
-                println!("✓ launch response");
-            }
-            _ => println!("(other message, keep reading)"),
+        Incoming::ReverseRequest(req) => {
+            println!("← reverse-request {}", req.command);
+            false
         }
-    }
-    // ---------------------------------------------------------------
-    // 5. configurationDone (required after initialized)
-    // ---------------------------------------------------------------
-    send("configurationDone", json!({}))?;
+    })
+    .await?;
 
-    // let resp = read_message()?;
-    // assert_eq!(resp["command"], "configurationDone");
+    send::<ConfigurationDone>(&mut client, ()).await?;
 
-    // ---------------------------------------------------------------
-    // 6. Wait for the stopped event
-    // ---------------------------------------------------------------
-    loop {
-        let msg = read_message()?;
-        if msg["type"] == "event" && msg["event"] == "stopped" {
+    recv_until(&mut client, |incoming| match incoming {
+        Incoming::Event(Event::Stopped(stopped)) => {
             println!("\n*** Program stopped ***");
-            println!("Reason: {}", msg["body"]["reason"]);
-            break;
+            println!("Reason: {}", reason_label(&stopped.reason));
+            if let Some(thread_id) = stopped.thread_id {
+                println!("Thread: {thread_id}");
+            }
+            true
         }
-        // You may also receive output / process / thread events — just keep reading
-    }
+        Incoming::Event(event) => {
+            println!(
+                "← event {}",
+                serde_json::to_string(event).unwrap_or_default()
+            );
+            false
+        }
+        Incoming::ReverseRequest(req) => {
+            println!("← reverse-request {}", req.command);
+            false
+        }
+    })
+    .await?;
 
-    // ---------------------------------------------------------------
-    // 7. Clean disconnect
-    // ---------------------------------------------------------------
-    send("disconnect", json!({ "terminateDebuggee": true }))?;
-    let _ = read_message(); // ignore response
+    let _ = send::<Disconnect>(
+        &mut client,
+        DisconnectArguments {
+            terminate_debuggee: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
 
-    // Wait for the child to exit
-    let status = child.wait()?;
-    println!("lldb-dap exited: {}", status);
-
+    let status = client.shutdown().await?;
+    println!("lldb-dap exited: {status}");
     Ok(())
+}
+
+async fn send<R: Request>(client: &mut Client, args: R::Arguments) -> Result<R::Response>
+where
+    R::Arguments: Serialize,
+    R::Response: Serialize,
+{
+    println!("→ {} {}", R::COMMAND, serde_json::to_string(&args)?);
+    let response = client
+        .request::<R>(args)
+        .await
+        .with_context(|| format!("{} failed", R::COMMAND))?;
+    println!("← {} {}", R::COMMAND, serde_json::to_string(&response)?);
+    Ok(response)
+}
+
+async fn recv_until(client: &mut Client, mut done: impl FnMut(&Incoming) -> bool) -> Result<()> {
+    loop {
+        let incoming = client.recv().await.context("failed to read DAP message")?;
+        if done(&incoming) {
+            return Ok(());
+        }
+    }
+}
+
+fn reason_label(reason: &StoppedReason) -> String {
+    match reason {
+        StoppedReason::Step => "step".into(),
+        StoppedReason::Breakpoint => "breakpoint".into(),
+        StoppedReason::Exception => "exception".into(),
+        StoppedReason::Pause => "pause".into(),
+        StoppedReason::Entry => "entry".into(),
+        StoppedReason::Goto => "goto".into(),
+        StoppedReason::FunctionBreakpoint => "function breakpoint".into(),
+        StoppedReason::DataBreakpoint => "data breakpoint".into(),
+        StoppedReason::InstructionBreakpoint => "instruction breakpoint".into(),
+        StoppedReason::Other(other) => other.clone(),
+    }
 }
