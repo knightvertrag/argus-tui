@@ -1,6 +1,6 @@
 # DAP implementation notes
 
-Low-level description of the current DAP stack. For layering and integration, see [`architecture.md`](./architecture.md). Spec: [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/specification).
+Low-level description of the DAP stack (framing, JSON types, `Client`). For layering and flow, see [`architecture.md`](./architecture.md). For `debugger::Session`, see [`session-implementation.md`](./session-implementation.md). Spec: [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/specification).
 
 ---
 
@@ -19,7 +19,7 @@ src/dap/
     tests.rs       JSON roundtrips (no adapter)
 ```
 
-`src/main.rs` is the only consumer. It is a binary crate (`mod dap;` from `main.rs`); there is no `lib.rs`.
+`debugger::Session` is the intended consumer of `dap::Client`. The crate is a binary (`mod dap;` / `mod debugger;` from `main.rs`); there is no `lib.rs`.
 
 ---
 
@@ -212,33 +212,17 @@ pub enum Incoming {
    - `Event` → parse, push `Incoming::Event`
    - `Request` → push `Incoming::ReverseRequest` (not answered)
 
+**`drain_inbox`:** take queued `Incoming` values without blocking. Session uses this after every DAP `request()`; see [`session-implementation.md`](./session-implementation.md).
+
 **`recv`:** pop inbox if non-empty; else read one frame. A `Response` here is an error (`expected: 0` in the current variant — meaning “no pending request”).
 
 **`shutdown(self)`:** `take()` the `Child`, `wait()`. After this, `Drop` does not kill.
 
 **`Drop`:** `start_kill()` if the child is still owned, so a failed harness does not leak `lldb-dap`.
 
-The client does not print. The harness logs `→` / `←` around `request` / `recv`.
+The client logs to stderr via `tracing` (not stdout). DEBUG: `seq` / `command` / `success` / event name. TRACE: JSON frame body. WARN: reverse requests (still queued, not answered). INFO: spawn and adapter exit status.
 
 `ClientError` wraps spawn, framing, I/O, JSON, `ProtocolError`, and unexpected responses.
-
----
-
-## Harness (`main.rs`)
-
-`#[tokio::main]`. Sequence:
-
-1. Require canonical `testdata/hello`.
-2. `Client::spawn()`.
-3. `request::<Initialize>(InitializeArguments::new("lldb-dap"))`.
-4. `request::<Launch>(program + stop_on_entry)`.
-5. `recv()` until `Event::Initialized` (events queued during launch come out of the inbox first).
-6. `request::<ConfigurationDone>(())` — waits for the response.
-7. `recv()` until `Event::Stopped`; print reason + thread id.
-8. `request::<Disconnect>({ terminate_debuggee: true })` — error ignored so shutdown still runs.
-9. `shutdown()`, print exit status.
-
-Helpers: `send::<R>` prints serialized args/response; `recv_until` loops `recv`.
 
 ---
 
@@ -249,7 +233,7 @@ Helpers: `send::<R>` prints serialized args/response; `recv_until` loops `recv`.
 - **Framing:** roundtrip, extra headers, spaced `Content-Length`, two frames, missing length, partial header/body EOF, invalid length.
 - **Types:** envelope JSON (including `request_seq` underscore), initialize advertise/decode + `extra` flags, failed response → `ProtocolError::Failed`, `()` body for missing/`{}`, event parse (`initialized`, `stopped`/`entry`, `output`, unknown `module`), camelCase ids, launch flatten extra.
 
-No unit test spawns `lldb-dap`. End-to-end is `cargo run`.
+No unit test spawns `lldb-dap`. Session tests live under `src/debugger/`. End-to-end is `cargo run` (harness on `Session`).
 
 ---
 
@@ -260,6 +244,7 @@ FramingError  ──► ClientError::Framing
 serde_json    ──► ClientError::Json
 ProtocolError ──► ClientError::Protocol   (Failed / Decode)
 io::Error     ──► ClientError::Io  or Spawn
+ClientError   ──► SessionError::Client
 anyhow        ◄── main.rs Context
 ```
 
@@ -272,7 +257,7 @@ Keep `thiserror` in `dap::*`. Do not use `color_eyre` inside the protocol module
 - One in-flight request. A second `request()` while one is pending is not supported (API is `&mut self` and sequential).
 - Reverse requests are queued and ignored. If an adapter ever sent `runInTerminal` and blocked on the reply, the session would stall. We do not advertise the capability.
 - `recv`’s unexpected-response error uses `expected: 0` rather than a dedicated variant.
-- `Event`’s `Serialize` form is the Rust enum (`{"Stopped":{…}}`, `{"Unknown":{…}}`), not the DAP wire shape. The wire shape is `EventMessage`. The harness prints `Event` for convenience.
+- `Event`’s `Serialize` form is the Rust enum (`{"Stopped":{…}}`, `{"Unknown":{…}}`), not the DAP wire shape. The wire shape is `EventMessage`.
 - First `stopped` after `stopOnEntry` may have reason `exception` on Apple `lldb-dap`.
 - Spawn is macOS-centric (`xcrun lldb-dap`). Linux would want `lldb-dap` on `PATH`.
-- `src/dap/types/mod.rs` still `allow(dead_code, unused_imports)` because many request markers are unused by the harness.
+- `src/dap/types/mod.rs` still `allow(dead_code, unused_imports)` because some request markers are only used via the session.

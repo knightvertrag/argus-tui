@@ -1,18 +1,17 @@
 mod dap;
+mod debugger;
+mod logging;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
 
-use dap::types::{
-    ConfigurationDone, Disconnect, DisconnectArguments, Event, Initialize, InitializeArguments,
-    Launch, LaunchArguments, Request, StoppedReason,
-};
-use dap::{Client, Incoming};
+use debugger::{LaunchConfig, Session};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::init();
+
     let program = PathBuf::from("testdata/hello");
     if !program.exists() {
         bail!(
@@ -21,106 +20,69 @@ async fn main() -> Result<()> {
     }
     let program = program.canonicalize()?;
 
-    let mut client = Client::spawn()?;
-
-    let _caps = send::<Initialize>(&mut client, InitializeArguments::new("lldb-dap")).await?;
-
-    let mut launch = LaunchArguments::new(program.to_string_lossy());
-    launch.stop_on_entry = Some(true);
-    send::<Launch>(&mut client, launch).await?;
-
-    recv_until(&mut client, |incoming| match incoming {
-        Incoming::Event(Event::Initialized) => {
-            println!("✓ initialized event");
-            true
-        }
-        Incoming::Event(event) => {
-            println!(
-                "← event {}",
-                serde_json::to_string(event).unwrap_or_default()
-            );
-            false
-        }
-        Incoming::ReverseRequest(req) => {
-            println!("← reverse-request {}", req.command);
-            false
-        }
-    })
-    .await?;
-
-    send::<ConfigurationDone>(&mut client, ()).await?;
-
-    recv_until(&mut client, |incoming| match incoming {
-        Incoming::Event(Event::Stopped(stopped)) => {
-            println!("\n*** Program stopped ***");
-            println!("Reason: {}", reason_label(&stopped.reason));
-            if let Some(thread_id) = stopped.thread_id {
-                println!("Thread: {thread_id}");
-            }
-            true
-        }
-        Incoming::Event(event) => {
-            println!(
-                "← event {}",
-                serde_json::to_string(event).unwrap_or_default()
-            );
-            false
-        }
-        Incoming::ReverseRequest(req) => {
-            println!("← reverse-request {}", req.command);
-            false
-        }
-    })
-    .await?;
-
-    let _ = send::<Disconnect>(
-        &mut client,
-        DisconnectArguments {
-            terminate_debuggee: Some(true),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let status = client.shutdown().await?;
-    println!("lldb-dap exited: {status}");
-    Ok(())
-}
-
-async fn send<R: Request>(client: &mut Client, args: R::Arguments) -> Result<R::Response>
-where
-    R::Arguments: Serialize,
-    R::Response: Serialize,
-{
-    println!("→ {} {}", R::COMMAND, serde_json::to_string(&args)?);
-    let response = client
-        .request::<R>(args)
+    let mut config = LaunchConfig::new(&program);
+    config.stop_on_entry = true;
+    let mut session = Session::launch(config)
         .await
-        .with_context(|| format!("{} failed", R::COMMAND))?;
-    println!("← {} {}", R::COMMAND, serde_json::to_string(&response)?);
-    Ok(response)
-}
+        .context("failed to launch debug session")?;
 
-async fn recv_until(client: &mut Client, mut done: impl FnMut(&Incoming) -> bool) -> Result<()> {
-    loop {
-        let incoming = client.recv().await.context("failed to read DAP message")?;
-        if done(&incoming) {
-            return Ok(());
+    session
+        .wait_until_stopped()
+        .await
+        .context("failed to wait for stop")?;
+
+    let state = session.state();
+    println!("\n*** Program stopped ({:?}) ***", state.phase);
+    if let Some(stopped) = &state.stopped {
+        println!("Reason: {:?}", stopped.reason);
+        if let Some(thread_id) = stopped.thread_id {
+            println!("Thread: {thread_id}");
         }
     }
-}
 
-fn reason_label(reason: &StoppedReason) -> String {
-    match reason {
-        StoppedReason::Step => "step".into(),
-        StoppedReason::Breakpoint => "breakpoint".into(),
-        StoppedReason::Exception => "exception".into(),
-        StoppedReason::Pause => "pause".into(),
-        StoppedReason::Entry => "entry".into(),
-        StoppedReason::Goto => "goto".into(),
-        StoppedReason::FunctionBreakpoint => "function breakpoint".into(),
-        StoppedReason::DataBreakpoint => "data breakpoint".into(),
-        StoppedReason::InstructionBreakpoint => "instruction breakpoint".into(),
-        StoppedReason::Other(other) => other.clone(),
+    println!("\nStack:");
+    for (index, frame) in state.frames.iter().enumerate() {
+        let path = frame
+            .source
+            .as_ref()
+            .and_then(|source| source.path.as_deref())
+            .unwrap_or("??");
+        println!(
+            "  #{index} {} at {}:{}:{}",
+            frame.name, path, frame.line, frame.column
+        );
     }
+
+    if let Some(location) = session.state().location()
+        && let Some(path) = &location.path
+    {
+        match session.sources().line(path, location.line) {
+            Ok(Some(text)) => {
+                println!("\n{}:{}", path.display(), location.line);
+                println!("  {text}");
+            }
+            Ok(None) => {}
+            Err(err) => println!("\n(could not read {}: {err})", path.display()),
+        }
+    }
+
+    let locals = session
+        .load_locals()
+        .await
+        .context("failed to load locals")?;
+    println!("\nLocals:");
+    if locals.is_empty() {
+        println!("  (none)");
+    } else {
+        for variable in locals {
+            match &variable.type_field {
+                Some(ty) => println!("  {} = {} ({ty})", variable.name, variable.value),
+                None => println!("  {} = {}", variable.name, variable.value),
+            }
+        }
+    }
+
+    let status = session.disconnect().await?;
+    println!("\nlldb-dap exited: {status}");
+    Ok(())
 }

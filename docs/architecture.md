@@ -1,184 +1,152 @@
-# Architecture — DAP layer as built
+# Architecture
 
-High-level view of what exists today, how the pieces fit, and how later layers (session, TUI, agents) are meant to plug in.
+How the pieces fit, and how a command flows from a future TUI (or agent) down to `lldb-dap`.
 
-The roadmap lives in [`tui-c-debugger-plan.md`](./tui-c-debugger-plan.md). Implementation details of the current DAP stack are in [`dap-implementation.md`](./dap-implementation.md).
+| Doc | Contents |
+|-----|----------|
+| This file | Layers, integration contract, launch/debug flow |
+| [`session-implementation.md`](./session-implementation.md) | `debugger::Session` internals |
+| [`dap-implementation.md`](./dap-implementation.md) | Framing, JSON types, `dap::Client` |
+| [`tui-c-debugger-plan.md`](./tui-c-debugger-plan.md) | Roadmap |
 
-**Status:** Phase 1 of the DAP client is partially complete. We can spawn `lldb-dap`, exchange framed typed messages, launch a C program, and wait until it stops. Stack/locals inspection and the TUI are not wired yet.
+**Status:** DAP client and debug session exist. `cargo run` is a smoke harness on `debugger::Session`. The TUI is still the ratatui template.
 
 ---
 
-## What we are building
+## Idea
 
-argus-tui is a terminal debugger frontend for C. The backend is not LLDB’s CLI; it is the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/) spoken by `lldb-dap`.
-
-That split is the whole product idea:
+argus-tui is a terminal debugger for C. The backend is not LLDB’s CLI; it is the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/) spoken by `lldb-dap`.
 
 - One protocol, so the UI is not tied to LLDB’s command language.
-- A pure session layer later, so a human TUI and an agent can drive the same debugger.
-- A small, hand-written client now, so we understand every byte on the wire before generating types from the schema.
+- A session layer, so a human TUI and an agent can issue the same commands against the same state.
+- A small hand-written DAP client, so we understand the wire before generating types from the schema.
 
 ---
 
-## Layers (target vs today)
-
-Target, from the project plan:
+## Layers
 
 ```
 ┌─────────────────────────────────────┐
-│           TUI (ratatui)             │  presentation + input
+│           TUI (ratatui)             │  not wired — template App remains
 ├─────────────────────────────────────┤
-│     Debug Session / State Machine   │  domain: stopped, frames, bps
+│     Debug Session / State Machine   │  implemented — debugger::Session
 ├─────────────────────────────────────┤
-│      DAP Client (lldb-dap)          │  protocol + process I/O     ← implemented
+│      DAP Client (lldb-dap)          │  implemented — framing + types + Client
 └─────────────────────────────────────┘
 ```
 
-Today only the bottom layer is real. The ratatui `App` in `src/app.rs` is still the template counter. `src/debugger/` is empty. `src/main.rs` is a **smoke harness** that plays the role of a future session: it issues typed requests and waits for typed events.
-
-That is deliberate. The harness is the first integration test of the client, not the product UI.
-
----
-
-## DAP stack (implemented)
+Today’s consumer of the session is `src/main.rs` (harness), not the TUI. That is the integration test for the middle layer.
 
 ```
-src/main.rs          smoke harness (current consumer)
-        │
+harness / TUI / agent
+        │  LaunchConfig, resume, step_*, load_locals, state()
         ▼
-src/dap/client.rs    spawn lldb-dap, seq, request/response, event inbox
-        │
+debugger::Session          phase, threads, frames, locals
+        │  request::<Initialize>, recv, drain_inbox
         ▼
-src/dap/types/       JSON shapes: Message envelope + Request trait + Event
-        │
-        ▼
-src/dap/framing.rs   Content-Length: N\r\n\r\n + UTF-8 body
-        │
+dap::Client                seq, one in-flight request, event inbox
+        │  Content-Length frames + JSON Message
         ▼
 lldb-dap stdin/stdout
 ```
 
-Each box has one job:
+| Layer | Owns | Must not |
+|-------|------|----------|
+| **TUI** | layout, keys, what to paint from `SessionState` | DAP JSON, process I/O |
+| **Session** | handshake, phase, inspect/step commands, domain events | `Content-Length`, `seq` |
+| **Client** | adapter process, framing, typed request/response | “what stopped means” |
 
-| Component | Responsibility | Does not do |
-|-----------|----------------|-------------|
-| **Framing** | Turn a byte stream into message bodies and back | JSON, commands, seq |
-| **Types** | Serde models for DAP JSON | I/O, process lifetime |
-| **Client** | Own the adapter process; send one typed request at a time; queue events | Session state, TUI |
-| **Harness** | Drive initialize → launch → configurationDone → stopped → disconnect | Interactive debugging |
-
-Nothing above the client should parse `Content-Length` or poke `msg["command"]`.
+Contract: **client emits typed DAP; session owns meaning; UI owns pixels.**
 
 ---
 
-## Two decode steps
+## Flow: start a debuggee
 
-A DAP message on the wire is always:
+Session hides the DAP startup order. Callers only pass a `LaunchConfig` and wait for a stop:
 
 ```
-{ "seq": …, "type": "request" | "response" | "event", … }
+caller                         Session                         lldb-dap
+  │                               │                               │
+  │── launch(config) ────────────►│                               │
+  │                               │── initialize ────────────────►│
+  │                               │◄─ initialize (capabilities) ──│
+  │                               │── launch ────────────────────►│
+  │                               │◄─ initialized event ──────────│
+  │                               │◄─ launch response ────────────│
+  │                               │── setBreakpoints? ───────────►│
+  │                               │── configurationDone ─────────►│
+  │◄─ Session ────────────────────│                               │
+  │── wait_until_stopped() ──────►│◄─ stopped / process / … ──────│
+  │◄─ Stopped + stack ────────────│                               │
 ```
 
-That is not enough to type the payload:
+Rules the session encodes (callers should not reimplement them):
 
-- A **response body** depends on which request `request_seq` belongs to.
-- An **event body** depends on the `event` name.
+1. Nothing else until `initialize` returns.
+2. `launch` is sent without waiting for `initialized`; both the response and that event are required before configuration.
+3. Breakpoints in `LaunchConfig` are set in that window, then `configurationDone`.
+4. `wait_until_stopped` is a separate call so the caller can still insert work (or just inspect) after launch.
 
-So we decode twice:
-
-1. **Envelope** (`types::Message`) — always succeeds for valid DAP, including unknown events and reverse requests.
-2. **Payload** — `ResponseMessage::decode_success::<R>()` after correlating `seq`, or `EventMessage::parse()` from the event name.
-
-Unknown adapter traffic (`module` events, extra capability flags) must not crash the client. Unknown events become `Event::Unknown`. Extra initialize flags land in `Capabilities::extra`.
+The harness uses `stop_on_entry: true` so it gets a stop without breakpoints. Apple `lldb-dap` often reports that first stop as a loader `exception` in dyld, not `entry` in `hello.c`.
 
 ---
 
-## How a request travels
+## Flow: a command while stopped
+
+Example: step over, then show locals.
 
 ```
-harness:  client.request::<Launch>(args)
-client:   seq = next_seq++
-          Message::Request { command: "launch", arguments }
-framing:  Content-Length: …\r\n\r\n{json}
-adapter:  … work …
-framing:  next frame
-client:   if Event → inbox
-          if Response.request_seq == seq → decode Launch body (())
-harness:  gets () or ProtocolError::Failed
+TUI/agent                      Session                         Client
+  │                               │                               │
+  │── step_over() ───────────────►│  phase must be Stopped        │
+  │                               │── next { threadId } ─────────►│
+  │◄─ ok (now Running) ───────────│                               │
+  │                               │                               │
+  │── wait_until_stopped() ──────►│  drain events                 │
+  │                               │◄─ stopped ────────────────────│
+  │                               │── threads + stackTrace ──────►│
+  │◄─ Stopped + frames ───────────│                               │
+  │── load_locals() ─────────────►│── scopes + variables ────────►│
+  │◄─ state().locals ─────────────│                               │
 ```
 
-Events that arrive *during* `request()` are not dropped. They sit in `Client.inbox` until the caller `recv()`s. That is how `launch` can return while `initialized` / `process` / `stopped` are still available to the harness.
+The session is sequential: one DAP request at a time. Events that arrive while a request is in flight are queued on the client and applied to `SessionState` before the command returns, so `stopped` cannot be lost behind a `continue` response.
 
-There is **one in-flight request**. Overlapping requests (a `oneshot` map keyed by seq) are a later client change.
+Callers that want a live event loop (TUI) use `next_event()` instead of `wait_until_stopped()`, then `refresh_stop_context()` / `load_locals()` when they see `SessionEvent::Stopped`.
 
 ---
 
-## Integration: the launch handshake
+## What each side of the session boundary looks like
 
-DAP’s startup order is easy to get wrong. The harness encodes the sequence we will reuse in the session layer:
+**Into the session** (stable for TUI and agents):
 
-```
-client                          lldb-dap
-  │                                │
-  │── initialize ─────────────────►│
-  │◄─ initialize response ─────────│   wait for this only
-  │── launch ─────────────────────►│   do not wait for initialized first
-  │◄─ initialized event ───────────│   may arrive before or after launch response
-  │◄─ launch response ─────────────│
-  │── configurationDone ──────────►│
-  │◄─ configurationDone response ──│
-  │◄─ stopped (and others) ────────│
-  │── disconnect ─────────────────►│
-```
+- `Session::launch` / `disconnect`
+- `resume`, `step_over`, `step_in`, `step_out`
+- `set_breakpoints`, `select_frame`, `load_locals`
+- `wait_until_stopped` or `next_event`
+- `state()` / `sources()`
 
-Rules we actually follow:
+**Out of the session:** `SessionState` (phase + inspect snapshots) and `SessionEvent` (DAP payloads wrapped, not re-invented).
 
-1. Until `initialize` returns, send nothing else (spec).
-2. Send `launch` immediately after; drain until both the launch response **and** the `initialized` event exist.
-3. Then `configurationDone`, and wait for its response (the old untyped harness skipped this).
-4. Then wait for `stopped`.
-
-`stopOnEntry: true` is how the harness gets a stop without setting breakpoints. On some `lldb-dap` builds the first stop reason is `exception` (loader) rather than `entry`. The client reports whatever the adapter sends.
+**Below the session:** `dap::Client::request::<R>()` and `Incoming::{Event, ReverseRequest}`. The session is the only module that should call those.
 
 ---
 
-## What the next layers should consume
+## Not built
 
-The session machine should talk to `dap::Client`, not to framing or JSON:
-
-```rust
-client.request::<Initialize>(InitializeArguments::new("lldb-dap")).await?;
-client.request::<Launch>(launch).await?;
-match client.recv().await? {
-    Incoming::Event(Event::Stopped(s)) => { /* update domain state */ }
-    Incoming::Event(Event::Unknown { event, .. }) => { /* log, ignore */ }
-    Incoming::ReverseRequest(_) => { /* not advertised; log */ }
-}
-```
-
-Domain events (`debugger::Stopped { thread, reason, … }`) should wrap these types, not replace them. The TUI should subscribe to domain state, not to `Message`.
-
-That is the integration contract: **Client emits typed DAP; session owns meaning; UI owns pixels.**
-
----
-
-## Explicitly not built
-
-- Debug session / breakpoint store / source cache (`src/debugger/`)
-- TUI panes (`src/ui/` is still the template)
-- Concurrent in-flight requests
-- Answering reverse requests (`runInTerminal`, `startDebugging`) — we do not advertise those client capabilities
+- TUI panes and keybindings (`src/ui/`, `src/app.rs` still template)
+- Concurrent in-flight DAP requests
+- Reverse requests (`runInTerminal`) — not advertised, not answered
 - Attach, evaluate, disassemble, memory
-- `tracing` (harness prints `→` / `←` JSON instead)
+
+Logs go to **stderr** (`tracing`). Default `argus_tui=info`; `RUST_LOG=argus_tui=debug` for DAP command/event names, `trace` for JSON bodies. See the DAP and session implementation docs.
 
 ---
 
-## How to run what exists
+## Run
 
 ```bash
 clang -g -O0 -o testdata/hello testdata/hello.c
-cargo test          # framing + type unit tests (no lldb-dap)
-cargo run           # smoke harness against testdata/hello (needs xcrun lldb-dap)
+cargo test          # framing, types, session state/source (no lldb-dap)
+cargo run           # harness via Session (needs xcrun lldb-dap)
 ```
-
-On macOS the client spawns `xcrun lldb-dap`. stderr is inherited so adapter errors show up in the same terminal.

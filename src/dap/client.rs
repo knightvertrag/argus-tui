@@ -4,6 +4,8 @@ use std::process::ExitStatus;
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use tracing::Instrument;
+
 use super::framing::{self, FramingError};
 use super::types::{Event, Message, ProtocolError, Request, RequestMessage, Seq};
 
@@ -56,6 +58,8 @@ impl Client {
         let stdin = child.stdin.take().ok_or(ClientError::MissingPipe)?;
         let stdout = child.stdout.take().ok_or(ClientError::MissingPipe)?;
 
+        tracing::info!("spawned xcrun lldb-dap");
+
         Ok(Self {
             child: Some(child),
             stdin,
@@ -71,9 +75,19 @@ impl Client {
     ) -> Result<R::Response, ClientError> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        let span = tracing::debug_span!("dap.request", command = R::COMMAND, seq);
+        self.send_and_wait::<R>(seq, args).instrument(span).await
+    }
 
+    async fn send_and_wait<R: Request>(
+        &mut self,
+        seq: Seq,
+        args: R::Arguments,
+    ) -> Result<R::Response, ClientError> {
+        tracing::debug!(seq, command = R::COMMAND, "dap request");
         let message = Message::Request(RequestMessage::new::<R>(seq, args)?);
         let body = serde_json::to_vec(&message)?;
+        tracing::trace!(json = %String::from_utf8_lossy(&body), "dap request body");
         framing::write(&mut self.stdin, &body).await?;
 
         loop {
@@ -82,6 +96,12 @@ impl Client {
                     return Ok(resp.decode_success::<R>()?);
                 }
                 Message::Response(resp) => {
+                    tracing::error!(
+                        expected = seq,
+                        got = resp.request_seq,
+                        command = %resp.command,
+                        "unexpected dap response"
+                    );
                     return Err(ClientError::UnexpectedResponse {
                         expected: seq,
                         got: resp.request_seq,
@@ -98,6 +118,11 @@ impl Client {
         }
     }
 
+    /// Events and reverse requests received while waiting for a response.
+    pub fn drain_inbox(&mut self) -> Vec<Incoming> {
+        self.inbox.drain(..).collect()
+    }
+
     pub async fn recv(&mut self) -> Result<Incoming, ClientError> {
         if let Some(incoming) = self.inbox.pop_front() {
             return Ok(incoming);
@@ -106,22 +131,49 @@ impl Client {
         match self.read_message().await? {
             Message::Event(event) => Ok(Incoming::Event(event.parse()?)),
             Message::Request(request) => Ok(Incoming::ReverseRequest(request)),
-            Message::Response(resp) => Err(ClientError::UnexpectedResponse {
-                expected: 0,
-                got: resp.request_seq,
-                command: resp.command,
-            }),
+            Message::Response(resp) => {
+                tracing::error!(
+                    got = resp.request_seq,
+                    command = %resp.command,
+                    "unexpected dap response with no pending request"
+                );
+                Err(ClientError::UnexpectedResponse {
+                    expected: 0,
+                    got: resp.request_seq,
+                    command: resp.command,
+                })
+            }
         }
     }
 
     pub async fn shutdown(mut self) -> Result<ExitStatus, ClientError> {
         let mut child = self.child.take().ok_or(ClientError::MissingPipe)?;
-        Ok(child.wait().await?)
+        let status = child.wait().await?;
+        tracing::info!(%status, "lldb-dap exited");
+        Ok(status)
     }
 
     async fn read_message(&mut self) -> Result<Message, ClientError> {
         let body = framing::read(&mut self.stdout).await?;
-        Ok(serde_json::from_slice(&body)?)
+        tracing::trace!(json = %String::from_utf8_lossy(&body), "dap frame");
+        let message: Message = serde_json::from_slice(&body)?;
+        match &message {
+            Message::Response(resp) => {
+                tracing::debug!(
+                    request_seq = resp.request_seq,
+                    command = %resp.command,
+                    success = resp.success,
+                    "dap response"
+                );
+            }
+            Message::Event(event) => {
+                tracing::debug!(seq = event.seq, event = %event.event, "dap event");
+            }
+            Message::Request(request) => {
+                tracing::warn!(command = %request.command, "dap reverse request ignored");
+            }
+        }
+        Ok(message)
     }
 }
 

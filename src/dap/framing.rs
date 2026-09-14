@@ -30,6 +30,7 @@ pub fn encode(body: &[u8]) -> Vec<u8> {
 }
 
 pub async fn write<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<(), FramingError> {
+    tracing::trace!(content_length = body.len(), "dap write");
     writer.write_all(&encode(body)).await?;
     writer.flush().await?;
     Ok(())
@@ -47,6 +48,7 @@ pub async fn read<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Fr
         }
         header_bytes += n;
         if header_bytes > MAX_HEADER_BYTES {
+            tracing::warn!(header_bytes, "DAP headers too large");
             return Err(FramingError::HeadersTooLarge);
         }
 
@@ -75,8 +77,11 @@ pub async fn read<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Fr
 
     let len = content_length.ok_or(FramingError::MissingContentLength)?;
     if len > MAX_BODY_BYTES {
+        tracing::warn!(content_length = len, "DAP body too large");
         return Err(FramingError::BodyTooLarge { len });
     }
+
+    tracing::trace!(content_length = len, "dap read");
 
     let mut body = vec![0u8; len];
     match reader.read_exact(&mut body).await {
