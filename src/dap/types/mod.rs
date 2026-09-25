@@ -21,15 +21,17 @@ pub use events::{
     ThreadEvent, ThreadEventReason,
 };
 pub use objects::{
-    Breakpoint, Capabilities, ErrorBody, ErrorMessage, Scope, Source, SourceBreakpoint, StackFrame,
-    StackFramePresentationHint, SteppingGranularity, Thread, Variable,
+    Breakpoint, Capabilities, ErrorBody, ErrorMessage, FunctionBreakpoint, Scope, Source,
+    SourceBreakpoint, StackFrame, StackFramePresentationHint, SteppingGranularity, Thread,
+    Variable,
 };
 pub use requests::{
     ConfigurationDone, Continue, ContinueArguments, ContinueResponse, Disconnect,
     DisconnectArguments, Evaluate, EvaluateArguments, EvaluateContext, EvaluateResponse,
     Initialize, InitializeArguments, Launch, LaunchArguments, Next, NextArguments, Scopes,
     ScopesArguments, ScopesResponse, SetBreakpoints, SetBreakpointsArguments,
-    SetBreakpointsResponse, StackTrace, StackTraceArguments, StackTraceResponse, StepIn,
+    SetBreakpointsResponse, SetFunctionBreakpoints, SetFunctionBreakpointsArguments,
+    SetFunctionBreakpointsResponse, StackTrace, StackTraceArguments, StackTraceResponse, StepIn,
     StepInArguments, StepOut, StepOutArguments, Threads, ThreadsResponse, Variables,
     VariablesArguments, VariablesFilter, VariablesResponse,
 };

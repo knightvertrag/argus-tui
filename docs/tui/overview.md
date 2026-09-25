@@ -45,7 +45,7 @@ draw loop ◀── watch::Receiver ──────────┘
 
 ## Empty states
 
-- Stopped with no source path (typical Apple `stopOnEntry` hit in `_dyld_start`): footer `Stopped in {function} (no source)`. The body repeats that line.
+- Stopped with no source path (a loader frame such as `_dyld_start`): footer `Stopped in {function} (no source)`. The body repeats that line. `--stop-on-entry` does not stop there; it breaks on `main`.
 - Source file unreadable: `source_error` in the body; the footer still shows `Ln` / `Col` when the frame has them.
 - Watch list empty: the pane is blank.
 - No breakpoint rows: the table header only.

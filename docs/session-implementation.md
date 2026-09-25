@@ -28,7 +28,7 @@ Logging: INFO for launch and phase changes (Stopped/Running/Exited/Terminated); 
 | `program` | Path to the debuggee |
 | `args` | argv after `program` |
 | `cwd` | Optional working directory |
-| `stop_on_entry` | DAP `stopOnEntry` |
+| `stop_on_entry` | Stop at `main`. Sent as `setFunctionBreakpoints`, not DAP `stopOnEntry` (that stops in the loader). |
 | `breakpoints` | `(source path, lines)` applied **after** `initialized` and **before** `configurationDone`. Lines become `BreakpointSpec`s with no condition. The TUI does not canonicalize these paths. |
 
 `LaunchConfig::new(program)` leaves `stop_on_entry` false.
@@ -67,11 +67,12 @@ Wraps DAP event payloads rather than replacing them: `Stopped(StoppedEvent)`, `O
 
 1. `Client::spawn()` (`xcrun lldb-dap`).
 2. `initialize` with `InitializeArguments::new("lldb-dap")`; store `Capabilities`.
-3. `launch` (`program`, `args`, `cwd`, `stopOnEntry`). Do **not** wait for `initialized` first.
+3. `launch` (`program`, `args`, `cwd`). `stopOnEntry` is always false. Do **not** wait for `initialized` first.
 4. `wait_for_initialized()` — `next_event()` until `SessionEvent::Initialized` (`Ended` if the debuggee dies).
-5. `set_breakpoints` for each entry in `LaunchConfig.breakpoints`.
-6. `configurationDone` if `supports_configuration_done_request`.
-7. If phase is not already `Stopped` / `Exited` / `Terminated`, set `Running`.
+5. If `stop_on_entry`, `setFunctionBreakpoints` with name `main`.
+6. `set_breakpoints` for each entry in `LaunchConfig.breakpoints`.
+7. `configurationDone` if `supports_configuration_done_request`.
+8. If phase is not already `Stopped` / `Exited` / `Terminated`, set `Running`.
 
 Every `request()` drains the client inbox afterward so `process` / `thread` / `stopped` that raced the response still update state.
 
@@ -168,7 +169,7 @@ load_locals, print
 disconnect
 ```
 
-On Apple `lldb-dap`, the first `stopOnEntry` stop is often `_dyld_start` with reason `Exception`, not `hello.c`. That is adapter behavior. Register groups from that stop are no longer mixed into `locals`; they land in `registers` after one level of expansion.
+`--stop-on-entry` installs a function breakpoint on `main` and does not set DAP `stopOnEntry`. On Apple `lldb-dap` the DAP flag stops in `_dyld_start` before any user source exists. Register groups from a loader stop are not mixed into `locals`; they land in `registers` after one level of expansion.
 
 `cargo run -- -b testdata/hello.c:14 testdata/hello` has been observed to stop with reason `Breakpoint` in `main`, as long as the path string is the one in DWARF. `canonicalize` on this machine rewrote `COde` to `Code` and the breakpoint stayed unverified. The TUI therefore keeps the path the user passed.
 

@@ -5,7 +5,7 @@ use ratatui::widgets::Block;
 pub const BG: Color = Color::Rgb(20, 20, 20);
 pub const BORDER: Color = Color::Rgb(48, 54, 61);
 pub const TITLE: Color = Color::Rgb(88, 196, 214);
-pub const MAGENTA: Color = Color::Rgb(198, 120, 221);
+pub const MAGENTA: Color = Color::Rgb(157, 124, 216);
 pub const GREEN: Color = Color::Rgb(152, 195, 121);
 pub const YELLOW: Color = Color::Rgb(229, 192, 123);
 pub const CURRENT: Color = Color::Rgb(42, 46, 56);

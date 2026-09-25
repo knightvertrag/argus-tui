@@ -8,11 +8,11 @@ use std::process::ExitStatus;
 
 use crate::dap::types::{
     ConfigurationDone, Continue, ContinueArguments, Disconnect, DisconnectArguments, Evaluate,
-    EvaluateArguments, EvaluateContext, Event, Initialize, InitializeArguments, Launch,
-    LaunchArguments, Next, NextArguments, Request, Scopes, ScopesArguments, SetBreakpoints,
-    SetBreakpointsArguments, Source, SourceBreakpoint, StackTrace, StackTraceArguments, StepIn,
-    StepInArguments, StepOut, StepOutArguments, StoppedEvent, Threads, Variables,
-    VariablesArguments,
+    EvaluateArguments, EvaluateContext, Event, FunctionBreakpoint, Initialize, InitializeArguments,
+    Launch, LaunchArguments, Next, NextArguments, Request, Scopes, ScopesArguments, SetBreakpoints,
+    SetBreakpointsArguments, SetFunctionBreakpoints, SetFunctionBreakpointsArguments, Source,
+    SourceBreakpoint, StackTrace, StackTraceArguments, StepIn, StepInArguments, StepOut,
+    StepOutArguments, StoppedEvent, Threads, Variables, VariablesArguments,
 };
 use crate::dap::{Client, ClientError, Incoming};
 
@@ -110,9 +110,15 @@ impl Session {
             .cwd
             .as_ref()
             .map(|cwd| cwd.to_string_lossy().into_owned());
-        launch.stop_on_entry = Some(config.stop_on_entry);
+        // DAP stopOnEntry stops in the loader (`_dyld_start`), not in main.
+        // A function breakpoint on `main` is the program entry the flag means.
+        launch.stop_on_entry = Some(false);
         session.request::<Launch>(launch).await?;
         session.wait_for_initialized().await?;
+
+        if config.stop_on_entry {
+            session.set_entry_breakpoint().await?;
+        }
 
         for (path, lines) in config.breakpoints {
             let specs: Vec<BreakpointSpec> = lines
@@ -221,6 +227,29 @@ impl Session {
             granularity: None,
         })
         .await
+    }
+
+    /// Break on `main` so `--stop-on-entry` stops in the program, not the loader.
+    async fn set_entry_breakpoint(&mut self) -> Result<(), SessionError> {
+        tracing::debug!("set_entry_breakpoint main");
+        let response = self
+            .request::<SetFunctionBreakpoints>(SetFunctionBreakpointsArguments {
+                breakpoints: vec![FunctionBreakpoint {
+                    name: "main".into(),
+                    condition: None,
+                    hit_condition: None,
+                }],
+            })
+            .await?;
+        for breakpoint in &response.breakpoints {
+            if !breakpoint.verified {
+                tracing::warn!(
+                    message = ?breakpoint.message,
+                    "entry breakpoint on main was not verified"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub async fn set_breakpoints(

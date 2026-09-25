@@ -266,6 +266,6 @@ Keep `thiserror` in `dap::*`. Do not use `color_eyre` inside the protocol module
 - `recv`’s unexpected-response error uses `expected: 0` rather than a dedicated variant.
 - Cancelling `request()` is still unsafe. Only the channel wait inside `recv` is cancellation-safe.
 - `Event`’s `Serialize` form is the Rust enum (`{"Stopped":{…}}`, `{"Unknown":{…}}`), not the DAP wire shape. The wire shape is `EventMessage`.
-- First `stopped` after `stopOnEntry` may have reason `exception` on Apple `lldb-dap`.
+- DAP `stopOnEntry` on Apple `lldb-dap` stops in `_dyld_start`. The session does not send it. `--stop-on-entry` is `setFunctionBreakpoints` on `main`.
 - Spawn is macOS-centric (`xcrun lldb-dap`). Linux would want `lldb-dap` on `PATH`.
 - `src/dap/types/mod.rs` still `allow(dead_code, unused_imports)` because some request markers are only used via the session.

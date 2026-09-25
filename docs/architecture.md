@@ -92,7 +92,7 @@ Rules the session encodes (callers should not reimplement them):
 3. Breakpoints in `LaunchConfig` are set in that window, then `configurationDone`.
 4. `wait_until_stopped` is a separate call so the caller can still insert work (or just inspect) after launch.
 
-The harness uses `stop_on_entry: true` so it gets a stop without breakpoints. Apple `lldb-dap` often reports that first stop as a loader `exception` in dyld, not `entry` in `hello.c`. The TUI leaves `stop_on_entry` off unless `--stop-on-entry` is passed, and takes breakpoints with `-b file:line` (path text kept as typed; see MEMORY gotchas).
+The harness sets `stop_on_entry`, which is a function breakpoint on `main`, so it stops in the program without a source breakpoint. DAP `stopOnEntry` is not sent: on Apple `lldb-dap` that stops in dyld. The TUI leaves the flag off unless `--stop-on-entry` is passed, and takes source breakpoints with `-b file:line` (path text kept as typed; see MEMORY gotchas).
 
 ---
 

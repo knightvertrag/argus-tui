@@ -187,10 +187,13 @@ impl ViewModel {
                 .iter()
                 .enumerate()
                 .map(|(index, frame)| {
-                    let place = frame
-                        .source
-                        .as_ref()
-                        .and_then(|source| source.path.as_deref().or(source.name.as_deref()));
+                    let place = frame.source.as_ref().and_then(|source| {
+                        source
+                            .path
+                            .as_deref()
+                            .and_then(crate::debugger::SessionState::source_file_path)
+                            .or(source.name.as_deref())
+                    });
                     let label = match place {
                         Some(path) => format!(
                             "#{index} {} at {}:{}",

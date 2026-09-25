@@ -91,11 +91,21 @@ impl SessionState {
             path: frame
                 .source
                 .as_ref()
-                .and_then(|source| source.path.as_ref())
+                .and_then(|source| source.path.as_deref())
+                .and_then(Self::source_file_path)
                 .map(PathBuf::from),
             line: frame.line,
             column: frame.column,
         })
+    }
+
+    /// DAP `source.path` for a loader symbol is `module`symbol`, not a file.
+    pub fn source_file_path(path: &str) -> Option<&str> {
+        if path.is_empty() || path.contains('`') {
+            None
+        } else {
+            Some(path)
+        }
     }
 
     pub fn current_frame(&self) -> Option<&StackFrame> {
@@ -261,6 +271,9 @@ mod tests {
         let loc = state.location().unwrap();
         assert_eq!(loc.function, "add");
         assert_eq!(loc.line, 5);
+
+        state.frames[0].source.as_mut().unwrap().path = Some("/usr/lib/dyld`_dyld_start".into());
+        assert_eq!(state.location().unwrap().path, None);
         assert_eq!(
             loc.path.as_deref(),
             Some(std::path::Path::new("/tmp/hello.c"))

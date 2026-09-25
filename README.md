@@ -2,7 +2,7 @@
 
 Terminal debugger for C. The UI is [ratatui](https://ratatui.rs); the backend is [`lldb-dap`](https://lldb.llvm.org/) over the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/).
 
-`cargo run -- <program>` is the debugger. `cargo run -- --harness` is the old smoke printer (launch `testdata/hello` with `stopOnEntry` and print stack / locals).
+`cargo run -- <program>` is the debugger. `cargo run -- --harness` is the old smoke printer (launch `testdata/hello`, break on `main`, and print stack / locals).
 
 ## Docs
 

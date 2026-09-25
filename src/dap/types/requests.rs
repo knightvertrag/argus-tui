@@ -5,8 +5,8 @@ use serde_json::{Map, Value};
 
 use super::Request;
 use super::objects::{
-    Breakpoint, Capabilities, Scope, Source, SourceBreakpoint, StackFrame, SteppingGranularity,
-    Thread, Variable,
+    Breakpoint, Capabilities, FunctionBreakpoint, Scope, Source, SourceBreakpoint, StackFrame,
+    SteppingGranularity, Thread, Variable,
 };
 
 pub enum Initialize {}
@@ -132,6 +132,27 @@ impl Request for ConfigurationDone {
     const COMMAND: &'static str = "configurationDone";
     type Arguments = ();
     type Response = ();
+}
+
+pub enum SetFunctionBreakpoints {}
+
+impl Request for SetFunctionBreakpoints {
+    const COMMAND: &'static str = "setFunctionBreakpoints";
+    type Arguments = SetFunctionBreakpointsArguments;
+    type Response = SetFunctionBreakpointsResponse;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFunctionBreakpointsArguments {
+    pub breakpoints: Vec<FunctionBreakpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFunctionBreakpointsResponse {
+    #[serde(default)]
+    pub breakpoints: Vec<Breakpoint>,
 }
 
 pub enum SetBreakpoints {}

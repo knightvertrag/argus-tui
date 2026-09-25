@@ -123,7 +123,7 @@ Framing: `Content-Length: N\r\n\r\n` + UTF-8 body; N is **bytes**. Caps 1 MiB he
 
 ## Gotchas
 
-- Apple `lldb-dap` + `stopOnEntry` often stops in `_dyld_start` with reason `Exception`, not `entry` in hello.c. The code pane then says `Stopped in _dyld_start (no source)`.
+- `--stop-on-entry` is a function breakpoint on `main`, not DAP `stopOnEntry`. The DAP flag stops in `_dyld_start` (`module`symbol` paths are not files). A loader frame still shows `Stopped in {name} (no source)`.
 - Source breakpoint `-b testdata/hello.c:14` **does** stop in `main` (reason `Breakpoint`) when the path string matches DWARF. Canonicalizing the path made it unverified on this machine.
 - arm64 lldb register names are `x0`, `x1`, … The prototype image showed x86 `rax`.
 - `Event` Serialize is the Rust enum shape, not DAP wire (`EventMessage` is the wire).
