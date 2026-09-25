@@ -73,6 +73,7 @@ pub enum StackFramePresentationHint {
 pub struct Scope {
     pub name: String,
     pub variables_reference: i64,
+    #[serde(default)]
     pub expensive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named_variables: Option<i64>,

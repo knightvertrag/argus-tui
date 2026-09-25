@@ -6,6 +6,22 @@ use crate::dap::types::{
     ProcessEvent, Scope, StackFrame, StoppedEvent, Thread, ThreadEventReason, Variable,
 };
 
+/// A source breakpoint the session asked the adapter to install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointSpec {
+    pub line: i64,
+    pub condition: Option<String>,
+}
+
+/// Spec we sent, plus the adapter's `Breakpoint` (id, verified, resolved line).
+///
+/// The adapter does not echo `condition`, so the spec is the only copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundBreakpoint {
+    pub spec: BreakpointSpec,
+    pub breakpoint: Breakpoint,
+}
+
 /// Coarse execution phase the UI and agents should branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -34,11 +50,12 @@ pub struct SessionState {
     pub focused_frame: Option<i64>,
     pub scopes: Vec<Scope>,
     pub locals: Vec<Variable>,
+    pub registers: Vec<Variable>,
     pub stopped: Option<StoppedEvent>,
     pub process: Option<ProcessEvent>,
     pub exit_code: Option<i64>,
     pub output: Vec<OutputEvent>,
-    pub breakpoints: BTreeMap<PathBuf, Vec<Breakpoint>>,
+    pub breakpoints: BTreeMap<PathBuf, Vec<BoundBreakpoint>>,
 }
 
 impl Default for SessionState {
@@ -52,6 +69,7 @@ impl Default for SessionState {
             focused_frame: None,
             scopes: Vec::new(),
             locals: Vec::new(),
+            registers: Vec::new(),
             stopped: None,
             process: None,
             exit_code: None,
@@ -95,6 +113,7 @@ impl SessionState {
         self.focused_frame = None;
         self.scopes.clear();
         self.locals.clear();
+        self.registers.clear();
     }
 
     /// Apply a DAP event. Returns whether this was a `stopped` event.
@@ -149,8 +168,10 @@ impl SessionState {
             Event::Breakpoint(BreakpointEvent { breakpoint, .. }) => {
                 if let Some(id) = breakpoint.id {
                     for bps in self.breakpoints.values_mut() {
-                        if let Some(existing) = bps.iter_mut().find(|bp| bp.id == Some(id)) {
-                            *existing = breakpoint.clone();
+                        if let Some(existing) =
+                            bps.iter_mut().find(|bp| bp.breakpoint.id == Some(id))
+                        {
+                            existing.breakpoint = breakpoint.clone();
                             break;
                         }
                     }
@@ -244,6 +265,43 @@ mod tests {
             loc.path.as_deref(),
             Some(std::path::Path::new("/tmp/hello.c"))
         );
+    }
+
+    #[test]
+    fn breakpoint_event_updates_verified_bit_and_keeps_condition() {
+        let mut state = SessionState::new();
+        let path = PathBuf::from("/tmp/main.c");
+        state.breakpoints.insert(
+            path.clone(),
+            vec![BoundBreakpoint {
+                spec: BreakpointSpec {
+                    line: 8,
+                    condition: Some("i == 10".into()),
+                },
+                breakpoint: Breakpoint {
+                    id: Some(1),
+                    verified: false,
+                    message: None,
+                    source: None,
+                    line: Some(8),
+                    column: None,
+                },
+            }],
+        );
+        state.apply_event(&Event::Breakpoint(BreakpointEvent {
+            reason: crate::dap::types::BreakpointEventReason::Changed,
+            breakpoint: Breakpoint {
+                id: Some(1),
+                verified: true,
+                message: None,
+                source: None,
+                line: Some(8),
+                column: None,
+            },
+        }));
+        let bound = &state.breakpoints[&path][0];
+        assert!(bound.breakpoint.verified);
+        assert_eq!(bound.spec.condition.as_deref(), Some("i == 10"));
     }
 
     #[test]

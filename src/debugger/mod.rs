@@ -7,11 +7,12 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use crate::dap::types::{
-    ConfigurationDone, Continue, ContinueArguments, Disconnect, DisconnectArguments, Event,
-    Initialize, InitializeArguments, Launch, LaunchArguments, Next, NextArguments, Request, Scopes,
-    ScopesArguments, SetBreakpoints, SetBreakpointsArguments, Source, SourceBreakpoint, StackTrace,
-    StackTraceArguments, StepIn, StepInArguments, StepOut, StepOutArguments, StoppedEvent, Threads,
-    Variables, VariablesArguments,
+    ConfigurationDone, Continue, ContinueArguments, Disconnect, DisconnectArguments, Evaluate,
+    EvaluateArguments, EvaluateContext, Event, Initialize, InitializeArguments, Launch,
+    LaunchArguments, Next, NextArguments, Request, Scopes, ScopesArguments, SetBreakpoints,
+    SetBreakpointsArguments, Source, SourceBreakpoint, StackTrace, StackTraceArguments, StepIn,
+    StepInArguments, StepOut, StepOutArguments, StoppedEvent, Threads, Variables,
+    VariablesArguments,
 };
 use crate::dap::{Client, ClientError, Incoming};
 
@@ -20,7 +21,7 @@ pub use source::CachedFile;
 pub use source::SourceCache;
 #[allow(unused_imports)]
 pub use state::Location;
-pub use state::{Phase, SessionState};
+pub use state::{BoundBreakpoint, BreakpointSpec, Phase, SessionState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -82,7 +83,6 @@ pub struct Session {
     sources: SourceCache,
 }
 
-#[allow(dead_code)]
 impl Session {
     /// Spawn `lldb-dap`, initialize, launch, optional breakpoints, configurationDone.
     pub async fn launch(config: LaunchConfig) -> Result<Session, SessionError> {
@@ -115,7 +115,14 @@ impl Session {
         session.wait_for_initialized().await?;
 
         for (path, lines) in config.breakpoints {
-            session.set_breakpoints(path, &lines).await?;
+            let specs: Vec<BreakpointSpec> = lines
+                .into_iter()
+                .map(|line| BreakpointSpec {
+                    line,
+                    condition: None,
+                })
+                .collect();
+            session.set_breakpoints(path, &specs).await?;
         }
 
         if session
@@ -219,9 +226,9 @@ impl Session {
     pub async fn set_breakpoints(
         &mut self,
         path: PathBuf,
-        lines: &[i64],
+        specs: &[BreakpointSpec],
     ) -> Result<Vec<crate::dap::types::Breakpoint>, SessionError> {
-        tracing::debug!(path = %path.display(), ?lines, "set_breakpoints");
+        tracing::debug!(path = %path.display(), lines = ?specs.iter().map(|spec| spec.line).collect::<Vec<_>>(), "set_breakpoints");
         let source = Source {
             name: path
                 .file_name()
@@ -229,12 +236,12 @@ impl Session {
             path: Some(path.to_string_lossy().into_owned()),
             source_reference: None,
         };
-        let breakpoints = lines
+        let breakpoints = specs
             .iter()
-            .map(|line| SourceBreakpoint {
-                line: *line,
+            .map(|spec| SourceBreakpoint {
+                line: spec.line,
                 column: None,
-                condition: None,
+                condition: spec.condition.clone(),
                 hit_condition: None,
             })
             .collect();
@@ -255,9 +262,8 @@ impl Session {
                 );
             }
         }
-        self.state
-            .breakpoints
-            .insert(path, response.breakpoints.clone());
+        let bound = bind_breakpoints(specs, response.breakpoints.clone());
+        self.state.breakpoints.insert(path, bound);
         Ok(response.breakpoints)
     }
 
@@ -288,7 +294,23 @@ impl Session {
         self.state.focused_frame = self.state.frames.first().map(|frame| frame.id);
         self.state.scopes.clear();
         self.state.locals.clear();
+        self.state.registers.clear();
         Ok(())
+    }
+
+    /// Focus `thread_id` and reload its stack. The id must already be in `state.threads`.
+    pub async fn select_thread(&mut self, thread_id: i64) -> Result<(), SessionError> {
+        self.require_phase(Phase::Stopped)?;
+        if !self
+            .state
+            .threads
+            .iter()
+            .any(|thread| thread.id == thread_id)
+        {
+            return Err(SessionError::NoThread);
+        }
+        self.state.focused_thread = Some(thread_id);
+        self.refresh_stop_context().await
     }
 
     pub async fn select_frame(&mut self, frame_id: i64) -> Result<(), SessionError> {
@@ -299,27 +321,39 @@ impl Session {
         self.state.focused_frame = Some(frame_id);
         self.state.scopes.clear();
         self.state.locals.clear();
+        self.state.registers.clear();
         Ok(())
     }
 
-    /// Scopes + non-expensive variables for the focused frame.
+    /// Locals for the focused frame. Also fills [`SessionState::registers`].
     pub async fn load_locals(&mut self) -> Result<&[crate::dap::types::Variable], SessionError> {
-        tracing::debug!("load_locals");
+        self.load_frame_variables().await?;
+        Ok(&self.state.locals)
+    }
+
+    /// Scopes for the focused frame.
+    ///
+    /// Non-expensive scopes other than `Registers` become locals. The `Registers`
+    /// scope is loaded even when the adapter marks it expensive.
+    pub async fn load_frame_variables(&mut self) -> Result<(), SessionError> {
+        tracing::debug!("load_frame_variables");
         self.require_phase(Phase::Stopped)?;
         let frame_id = self.state.focused_frame.ok_or(SessionError::NoFrame)?;
         let scopes = self.request::<Scopes>(ScopesArguments { frame_id }).await?;
         self.state.scopes = scopes.scopes;
 
-        let mut locals = Vec::new();
-        let references: Vec<i64> = self
+        let plan: Vec<(bool, i64)> = self
             .state
             .scopes
             .iter()
-            .filter(|scope| !scope.expensive)
-            .map(|scope| scope.variables_reference)
-            .filter(|reference| *reference > 0)
+            .filter(|scope| scope.variables_reference > 0)
+            .filter(|scope| scope.name == "Registers" || !scope.expensive)
+            .map(|scope| (scope.name == "Registers", scope.variables_reference))
             .collect();
-        for variables_reference in references {
+
+        let mut locals = Vec::new();
+        let mut registers = Vec::new();
+        for (is_registers, variables_reference) in plan {
             let response = self
                 .request::<Variables>(VariablesArguments {
                     variables_reference,
@@ -328,10 +362,63 @@ impl Session {
                     count: None,
                 })
                 .await?;
-            locals.extend(response.variables);
+            if is_registers {
+                // lldb-dap nests rax/rdi under groups such as "General Purpose Registers".
+                let groups = response.variables;
+                let child_refs: Vec<i64> = groups
+                    .iter()
+                    .map(|variable| variable.variables_reference)
+                    .filter(|reference| *reference > 0)
+                    .collect();
+                if child_refs.is_empty() {
+                    registers.extend(groups);
+                } else {
+                    for reference in child_refs {
+                        let children = self
+                            .request::<Variables>(VariablesArguments {
+                                variables_reference: reference,
+                                filter: None,
+                                start: None,
+                                count: None,
+                            })
+                            .await?;
+                        registers.extend(children.variables);
+                    }
+                }
+            } else {
+                locals.extend(response.variables);
+            }
         }
         self.state.locals = locals;
-        Ok(&self.state.locals)
+        self.state.registers = registers;
+        tracing::debug!(
+            locals = self.state.locals.len(),
+            registers = self.state.registers.len(),
+            sample = ?self
+                .state
+                .registers
+                .iter()
+                .take(4)
+                .map(|variable| format!("{}={}", variable.name, variable.value))
+                .collect::<Vec<_>>(),
+            "loaded frame variables"
+        );
+        Ok(())
+    }
+
+    /// DAP `evaluate` in the watch context of the focused frame.
+    pub async fn evaluate(&mut self, expression: &str) -> Result<String, SessionError> {
+        tracing::debug!(expression, "evaluate");
+        self.require_phase(Phase::Stopped)?;
+        let frame_id = self.state.focused_frame.ok_or(SessionError::NoFrame)?;
+        let response = self
+            .request::<Evaluate>(EvaluateArguments {
+                expression: expression.to_string(),
+                frame_id: Some(frame_id),
+                context: Some(EvaluateContext::Watch),
+            })
+            .await?;
+        Ok(response.result)
     }
 
     pub async fn disconnect(mut self) -> Result<ExitStatus, SessionError> {
@@ -437,4 +524,21 @@ impl Session {
         self.require_phase(Phase::Stopped)?;
         self.state.focused_thread.ok_or(SessionError::NoThread)
     }
+}
+
+fn bind_breakpoints(
+    specs: &[BreakpointSpec],
+    reported: Vec<crate::dap::types::Breakpoint>,
+) -> Vec<BoundBreakpoint> {
+    reported
+        .into_iter()
+        .enumerate()
+        .map(|(index, breakpoint)| {
+            let spec = specs.get(index).cloned().unwrap_or(BreakpointSpec {
+                line: breakpoint.line.unwrap_or(0),
+                condition: None,
+            });
+            BoundBreakpoint { spec, breakpoint }
+        })
+        .collect()
 }

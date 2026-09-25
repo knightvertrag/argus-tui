@@ -335,6 +335,41 @@ pub struct StepOutArguments {
     pub granularity: Option<SteppingGranularity>,
 }
 
+pub enum Evaluate {}
+
+impl Request for Evaluate {
+    const COMMAND: &'static str = "evaluate";
+    type Arguments = EvaluateArguments;
+    type Response = EvaluateResponse;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluateArguments {
+    pub expression: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<EvaluateContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvaluateContext {
+    #[serde(rename = "watch")]
+    Watch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluateResponse {
+    #[serde(default)]
+    pub result: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub type_field: Option<String>,
+    #[serde(default)]
+    pub variables_reference: i64,
+}
+
 pub enum Disconnect {}
 
 impl Request for Disconnect {

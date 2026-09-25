@@ -26,11 +26,12 @@ pub use objects::{
 };
 pub use requests::{
     ConfigurationDone, Continue, ContinueArguments, ContinueResponse, Disconnect,
-    DisconnectArguments, Initialize, InitializeArguments, Launch, LaunchArguments, Next,
-    NextArguments, Scopes, ScopesArguments, ScopesResponse, SetBreakpoints,
-    SetBreakpointsArguments, SetBreakpointsResponse, StackTrace, StackTraceArguments,
-    StackTraceResponse, StepIn, StepInArguments, StepOut, StepOutArguments, Threads,
-    ThreadsResponse, Variables, VariablesArguments, VariablesFilter, VariablesResponse,
+    DisconnectArguments, Evaluate, EvaluateArguments, EvaluateContext, EvaluateResponse,
+    Initialize, InitializeArguments, Launch, LaunchArguments, Next, NextArguments, Scopes,
+    ScopesArguments, ScopesResponse, SetBreakpoints, SetBreakpointsArguments,
+    SetBreakpointsResponse, StackTrace, StackTraceArguments, StackTraceResponse, StepIn,
+    StepInArguments, StepOut, StepOutArguments, Threads, ThreadsResponse, Variables,
+    VariablesArguments, VariablesFilter, VariablesResponse,
 };
 
 /// Sequence number shared by requests, responses, and events.

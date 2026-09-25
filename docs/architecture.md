@@ -1,15 +1,17 @@
 # Architecture
 
-How the pieces fit, and how a command flows from a future TUI (or agent) down to `lldb-dap`.
+How the pieces fit, and how a command flows from the TUI (or a future agent) down to `lldb-dap`.
 
 | Doc | Contents |
 |-----|----------|
+| [`../MEMORY.md`](../MEMORY.md) | LLM pickup — decisions, APIs, gotchas |
 | This file | Layers, integration contract, launch/debug flow |
 | [`session-implementation.md`](./session-implementation.md) | `debugger::Session` internals |
 | [`dap-implementation.md`](./dap-implementation.md) | Framing, JSON types, `dap::Client` |
+| [`tui/README.md`](./tui/README.md) | TUI implementation: driver, screen, input |
 | [`tui-c-debugger-plan.md`](./tui-c-debugger-plan.md) | Roadmap |
 
-**Status:** DAP client and debug session exist. `cargo run` is a smoke harness on `debugger::Session`. The TUI is still the ratatui template.
+**Status:** The TUI is wired. `cargo run -- <program>` draws the debugger. `cargo run -- --harness` is the smoke printer. DAP client and `debugger::Session` sit under a driver that owns the session.
 
 ---
 
@@ -27,28 +29,31 @@ argus-tui is a terminal debugger for C. The backend is not LLDB’s CLI; it is t
 
 ```
 ┌─────────────────────────────────────┐
-│           TUI (ratatui)             │  not wired — template App remains
+│     TUI (ratatui) + driver          │  ui paints ViewModel; driver owns Session
 ├─────────────────────────────────────┤
-│     Debug Session / State Machine   │  implemented — debugger::Session
+│     Debug Session / State Machine   │  debugger::Session
 ├─────────────────────────────────────┤
-│      DAP Client (lldb-dap)          │  implemented — framing + types + Client
+│      DAP Client (lldb-dap)          │  framing + types + Client
 └─────────────────────────────────────┘
 ```
 
-Today’s consumer of the session is `src/main.rs` (harness), not the TUI. That is the integration test for the middle layer.
-
 ```
-harness / TUI / agent
-        │  LaunchConfig, resume, step_*, load_locals, state()
+keys / prompt
+        │  Command
         ▼
-debugger::Session          phase, threads, frames, locals
+driver                     owns Session, publishes ViewModel
+        │  LaunchConfig, resume, step_*, set_breakpoints, evaluate, …
+        ▼
+debugger::Session          phase, threads, frames, locals, registers, breakpoints
         │  request::<Initialize>, recv, drain_inbox
         ▼
-dap::Client                seq, one in-flight request, event inbox
+dap::Client                seq, one in-flight request, frame-reader task
         │  Content-Length frames + JSON Message
         ▼
 lldb-dap stdin/stdout
 ```
+
+The draw loop never calls `Session`. Widgets read a `ViewModel` snapshot. `--harness` calls `Session` directly and does not draw.
 
 | Layer | Owns | Must not |
 |-------|------|----------|
@@ -87,7 +92,7 @@ Rules the session encodes (callers should not reimplement them):
 3. Breakpoints in `LaunchConfig` are set in that window, then `configurationDone`.
 4. `wait_until_stopped` is a separate call so the caller can still insert work (or just inspect) after launch.
 
-The harness uses `stop_on_entry: true` so it gets a stop without breakpoints. Apple `lldb-dap` often reports that first stop as a loader `exception` in dyld, not `entry` in `hello.c`.
+The harness uses `stop_on_entry: true` so it gets a stop without breakpoints. Apple `lldb-dap` often reports that first stop as a loader `exception` in dyld, not `entry` in `hello.c`. The TUI leaves `stop_on_entry` off unless `--stop-on-entry` is passed, and takes breakpoints with `-b file:line` (path text kept as typed; see MEMORY gotchas).
 
 ---
 
@@ -112,7 +117,7 @@ TUI/agent                      Session                         Client
 
 The session is sequential: one DAP request at a time. Events that arrive while a request is in flight are queued on the client and applied to `SessionState` before the command returns, so `stopped` cannot be lost behind a `continue` response.
 
-Callers that want a live event loop (TUI) use `next_event()` instead of `wait_until_stopped()`, then `refresh_stop_context()` / `load_locals()` when they see `SessionEvent::Stopped`.
+The driver uses `next_event()` instead of `wait_until_stopped()`. On `Stopped` it calls `refresh_stop_context`, `load_frame_variables`, and `evaluate` for each watch. It also inspects if phase is already `Stopped` when a step call returns, because that stop may have been applied from the inbox. `request()` is awaited to completion. `next_event` may be dropped when a key arrives; the frame reader makes that safe. See [`dap-implementation.md`](./dap-implementation.md).
 
 ---
 
@@ -122,8 +127,9 @@ Callers that want a live event loop (TUI) use `next_event()` instead of `wait_un
 
 - `Session::launch` / `disconnect`
 - `resume`, `step_over`, `step_in`, `step_out`
-- `set_breakpoints`, `select_frame`, `load_locals`
-- `wait_until_stopped` or `next_event`
+- `set_breakpoints` (`BreakpointSpec`: line + optional condition), `select_thread`, `select_frame`
+- `load_frame_variables` / `load_locals`, `evaluate`
+- `wait_until_stopped` (harness) or `next_event` (driver)
 - `state()` / `sources()`
 
 **Out of the session:** `SessionState` (phase + inspect snapshots) and `SessionEvent` (DAP payloads wrapped, not re-invented).
@@ -134,12 +140,13 @@ Callers that want a live event loop (TUI) use `next_event()` instead of `wait_un
 
 ## Not built
 
-- TUI panes and keybindings (`src/ui/`, `src/app.rs` still template)
 - Concurrent in-flight DAP requests
 - Reverse requests (`runInTerminal`) — not advertised, not answered
-- Attach, evaluate, disassemble, memory
+- Attach, disassembly, memory, expanding structured variable children
+- Launch-config files and source path rewriting
+- An agent transport (the driver `Command` channel is in-process only)
 
-Logs go to **stderr** (`tracing`). Default `argus_tui=info`; `RUST_LOG=argus_tui=debug` for DAP command/event names, `trace` for JSON bodies. See the DAP and session implementation docs.
+Logs: the TUI writes `tracing` to **`argus-tui.log`**. The harness writes it to **stderr**. Default `argus_tui=info`; `RUST_LOG=argus_tui=debug` for DAP command/event names, `trace` for JSON bodies. Adapter stderr is not inherited; the client traces it at debug (`lldb_dap`).
 
 ---
 
@@ -147,6 +154,7 @@ Logs go to **stderr** (`tracing`). Default `argus_tui=info`; `RUST_LOG=argus_tui
 
 ```bash
 clang -g -O0 -o testdata/hello testdata/hello.c
-cargo test          # framing, types, session state/source (no lldb-dap)
-cargo run           # harness via Session (needs xcrun lldb-dap)
+cargo test          # framing, types, session, highlight, commands, UI (no lldb-dap)
+cargo run -- -b testdata/hello.c:14 testdata/hello
+cargo run -- --harness
 ```

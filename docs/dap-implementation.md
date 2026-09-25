@@ -122,9 +122,10 @@ Commands are uninhabited marker enums (`pub enum Initialize {}`) plus `impl Requ
 | `Next` | `next` | `NextArguments` | `()` |
 | `StepIn` | `stepIn` | `StepInArguments` | `()` |
 | `StepOut` | `stepOut` | `StepOutArguments` | `()` |
+| `Evaluate` | `evaluate` | `EvaluateArguments` (`expression`, `frameId`, `context: "watch"`) | `EvaluateResponse` (`result`, optional `type`, `variablesReference`) |
 | `Disconnect` | `disconnect` | `DisconnectArguments` | `()` |
 
-The harness currently sends initialize, launch, configurationDone, disconnect. The rest are typed and ready for the session layer.
+The session sends these. The harness path uses initialize, launch, configurationDone, threads, stackTrace, scopes, variables, disconnect. The TUI driver also sends setBreakpoints, continue/next/stepIn/stepOut, and evaluate.
 
 ### Serde traps
 
@@ -189,7 +190,7 @@ The spec type `Message` (structured error) is named `ErrorMessage` so it does no
 pub struct Client {
     child: Option<Child>,          // None after shutdown()
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    frames: UnboundedReceiver<Result<Message, ClientError>>,
     next_seq: Seq,                 // starts at 1
     inbox: VecDeque<Incoming>,
 }
@@ -200,27 +201,32 @@ pub enum Incoming {
 }
 ```
 
-**Spawn:** `xcrun lldb-dap`, stdin/stdout piped, stderr inherited. Failure → `ClientError::Spawn`. Missing pipes → `MissingPipe`.
+**Spawn:** `xcrun lldb-dap`, stdin/stdout/stderr piped. Failure → `ClientError::Spawn`. Missing pipes → `MissingPipe`. Must run inside a tokio runtime.
+
+Stdout is owned by a task. That task is the only caller of `framing::read`. It sends complete `Message`s on an unbounded channel. `framing::read` is not cancellation-safe (a dropped read loses bytes already pulled into a local buffer). `recv().await` only waits on the channel, so the TUI may cancel it. Do not cancel `request()`: the matching response would sit on the channel and the next read would treat it as unexpected.
+
+Stderr lines are traced at debug with target `lldb_dap` so they do not land on the alternate screen.
 
 **`request::<R>`:**
 
 1. Take `next_seq`, increment.
 2. `RequestMessage::new::<R>`, wrap `Message::Request`, `serde_json::to_vec`, `framing::write`.
-3. Loop `read_message`:
+3. Loop `next_frame` (channel recv):
    - `Response` with matching `request_seq` → `decode_success::<R>()`
    - other `Response` → `UnexpectedResponse` (no concurrent requests)
    - `Event` → parse, push `Incoming::Event`
    - `Request` → push `Incoming::ReverseRequest` (not answered)
+   - channel closed → `ClientError::Closed`
 
 **`drain_inbox`:** take queued `Incoming` values without blocking. Session uses this after every DAP `request()`; see [`session-implementation.md`](./session-implementation.md).
 
-**`recv`:** pop inbox if non-empty; else read one frame. A `Response` here is an error (`expected: 0` in the current variant — meaning “no pending request”).
+**`recv`:** pop inbox if non-empty; else take one frame from the channel. A `Response` here is an error (`expected: 0` — no pending request).
 
 **`shutdown(self)`:** `take()` the `Child`, `wait()`. After this, `Drop` does not kill.
 
-**`Drop`:** `start_kill()` if the child is still owned, so a failed harness does not leak `lldb-dap`.
+**`Drop`:** `start_kill()` if the child is still owned, so a failed session does not leak `lldb-dap`. The reader task ends when stdout hits EOF.
 
-The client logs to stderr via `tracing` (not stdout). DEBUG: `seq` / `command` / `success` / event name. TRACE: JSON frame body. WARN: reverse requests (still queued, not answered). INFO: spawn and adapter exit status.
+The client logs via `tracing` (not stdout). Where those lines go depends on the process: stderr for `--harness`, `argus-tui.log` for the TUI. DEBUG: `seq` / `command` / `success` / event name. TRACE: JSON frame body. WARN: reverse requests (still queued, not answered). INFO: spawn and adapter exit status.
 
 `ClientError` wraps spawn, framing, I/O, JSON, `ProtocolError`, and unexpected responses.
 
@@ -231,9 +237,10 @@ The client logs to stderr via `tracing` (not stdout). DEBUG: `seq` / `command` /
 `cargo test` compiles the binary with `cfg(test)` (no library target).
 
 - **Framing:** roundtrip, extra headers, spaced `Content-Length`, two frames, missing length, partial header/body EOF, invalid length.
+- **Client reader:** two back-to-back event frames delivered on the channel; cancelling `recv` leaves the first frame queued.
 - **Types:** envelope JSON (including `request_seq` underscore), initialize advertise/decode + `extra` flags, failed response → `ProtocolError::Failed`, `()` body for missing/`{}`, event parse (`initialized`, `stopped`/`entry`, `output`, unknown `module`), camelCase ids, launch flatten extra.
 
-No unit test spawns `lldb-dap`. Session tests live under `src/debugger/`. End-to-end is `cargo run` (harness on `Session`).
+No unit test spawns `lldb-dap`. Session tests live under `src/debugger/`. End-to-end is `cargo run -- --harness` or `cargo run -- -b file:line program`.
 
 ---
 
@@ -257,6 +264,7 @@ Keep `thiserror` in `dap::*`. Do not use `color_eyre` inside the protocol module
 - One in-flight request. A second `request()` while one is pending is not supported (API is `&mut self` and sequential).
 - Reverse requests are queued and ignored. If an adapter ever sent `runInTerminal` and blocked on the reply, the session would stall. We do not advertise the capability.
 - `recv`’s unexpected-response error uses `expected: 0` rather than a dedicated variant.
+- Cancelling `request()` is still unsafe. Only the channel wait inside `recv` is cancellation-safe.
 - `Event`’s `Serialize` form is the Rust enum (`{"Stopped":{…}}`, `{"Unknown":{…}}`), not the DAP wire shape. The wire shape is `EventMessage`.
 - First `stopped` after `stopOnEntry` may have reason `exception` on Apple `lldb-dap`.
 - Spawn is macOS-centric (`xcrun lldb-dap`). Linux would want `lldb-dap` on `PATH`.

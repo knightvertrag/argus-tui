@@ -2,8 +2,8 @@
 
 > A professional, educational roadmap for building a modern Rust TUI frontend for debugging C programs using the Debug Adapter Protocol (DAP) and `lldb-dap`.
 
-**Status:** DAP types + framing + client + **session APIs** exist; smoke harness prints stop/stack/locals (see [architecture.md](./architecture.md), [session-implementation.md](./session-implementation.md), [dap-implementation.md](./dap-implementation.md))  
-**Last updated:** 2026-09-14  
+**Status:** Phases 0–2 are in the tree. `cargo run -- <program>` is the TUI (source, watches, breakpoints, registers, threads, call stack, terminal, `c`/`n`/`s`/`f`). `--harness` still prints one stop. Phase 3 is only partly started: source breakpoints and `evaluate` watches exist; launch configs, path mapping, and variable children do not. Implementation of the screen is [`tui/README.md`](./tui/README.md). The layer contract is [architecture.md](./architecture.md).
+**Last updated:** 2026-09-25  
 **Target audience:** Intermediate learner (beginner–intermediate Rust, no prior TUI or deep debugger experience)
 
 ---
@@ -54,7 +54,7 @@ Keep three clean layers:
 |--------------------|---------------------------------------------|-----------|
 | TUI                | **ratatui** + **crossterm**                 | Current standard, excellent docs, active ecosystem |
 | Async runtime      | **tokio**                                   | Required for process I/O and future agent work |
-| Error handling     | **color-eyre** + **thiserror**              | Excellent DX for learning and production |
+| Error handling     | **anyhow** in `main`, **thiserror** in `dap` / `debugger` | `color-eyre` was dropped when the template went away |
 | Logging            | **tracing** + **tracing-subscriber**        | Essential for debugging a debugger |
 | Serialization      | **serde** + **serde_json**                  | DAP is JSON |
 | DAP types          | Hand-written first, generate later          | Full control + high educational value |
@@ -72,7 +72,7 @@ cargo generate ratatui/templates
 # Choose: Event Driven Async  (or Component for more structure)
 ```
 
-Then restructure into the layout below.
+Then restructure into the layout below. That sketch is historical. The live tree is in [MEMORY.md](../MEMORY.md): `driver.rs` owns the session, `ui/` paints a `ViewModel`, and there is no `app.rs`.
 
 ### Suggested Directory Structure
 
@@ -107,7 +107,7 @@ src/
 
 ## 5. Phased Implementation Plan
 
-### Phase 0 — Foundations (1–2 weeks)
+### Phase 0 — Foundations (done)
 **Goal:** Comfort with the basic tools.
 
 - Master a simple ratatui event loop and layout.
@@ -119,7 +119,7 @@ src/
 
 ---
 
-### Phase 1 — Minimal DAP Client (highest learning density)
+### Phase 1 — Minimal DAP Client (done)
 **Goal:** A working protocol client that can stop a program and inspect state.
 
 Implement only what is required:
@@ -136,27 +136,29 @@ Implement only what is required:
 
 ---
 
-### Phase 2 — First Useful TUI
+### Phase 2 — First Useful TUI (done)
 **Goal:** A usable interactive debugger.
 
-Classic layout:
+What shipped, matching `screens/tui_proto.jpg` for the Code tab:
 
-- Source pane (current line highlight + breakpoint markers)
-- Stack frames
-- Variables / Locals
-- Status bar (`Running` / `Stopped` / `Exited`)
-- Simple keybindings (`n`, `s`, `c`, `q`, arrow keys, etc.)
+- Source pane (current line, arrow, breakpoint line numbers, C highlighting)
+- Watch pane (`evaluate` in the watch context)
+- Breakpoints as ID / Location / Condition rows, Watch, and Call Stack on the left
+- Variables and a short Register pane on the right (`screens/tui_dense.jpg`)
+- Tabs: Code, Vars, Stack, Threads, Memory, Terminal
+- Keys `c` / `n` / `s` / `f` / `b` / `q`, and a `>` prompt for `break`, `watch`, `thread`, `frame`
+- Footer shows `Ln` / `Col` / function, or `Running` / `Exited`
 
-**Exit criteria:** You can step through a small C program entirely from the TUI.
+**Exit criteria:** You can step through a small C program entirely from the TUI. Met with `cargo run -- -b testdata/hello.c:14 testdata/hello` (stop reason `Breakpoint` in `main`).
 
 ---
 
 ### Phase 3 — Real Power
 **Goal:** Feature parity with a solid everyday debugger.
 
-- Source breakpoints + conditional breakpoints
-- Multiple threads
-- Expression evaluation in the debug console
+- Source breakpoints + conditional breakpoints (first cut is in: `break file:line if cond`; no hit counts)
+- Multiple threads (list and `thread <id>` exist; not a daily-driver threads UI)
+- Expression evaluation in the debug console (`watch <expr>` exists; no REPL, no variable-child expansion)
 - Launch configurations (`.vscode/launch.json`-style or custom)
 - Source path mapping / rewriting
 - Output / console filtering
@@ -244,20 +246,20 @@ This is the pattern used by several modern “AI debugger” projects.
 
 ## 10. Suggested First Milestone Checklist
 
-- [ ] Project created from ratatui event-driven-async template
-- [ ] Directory structure in place
-- [ ] Can spawn `lldb-dap` and exchange a simple `initialize` request/response
-- [ ] Content-Length framing correctly implemented
-- [ ] Can launch a tiny C program and receive a `stopped` event
-- [ ] Can request `stackTrace` and print frames
-- [ ] Minimal TUI that shows source + current line
-- [ ] `n` / `s` / `c` keybindings work
+- [x] Project created from ratatui event-driven-async template
+- [x] Directory structure in place
+- [x] Can spawn `lldb-dap` and exchange a simple `initialize` request/response
+- [x] Content-Length framing correctly implemented
+- [x] Can launch a tiny C program and receive a `stopped` event
+- [x] Can request `stackTrace` and print frames
+- [x] Minimal TUI that shows source + current line
+- [x] `n` / `s` / `c` keybindings work
 
 ---
 
 ## 11. Open Design Questions (to revisit)
 
-- Preferred keybinding style (vim-like, classic gdb, or hybrid)?
+- Preferred keybinding style — current choice is hybrid: single keys in the view (`c`/`n`/`s`/`f`), words on the prompt. Revisit if that splits badly.
 - Support for attach vs launch first?
 - How early to introduce launch configuration files?
 - Whether to generate DAP types from the official JSON schema later?
